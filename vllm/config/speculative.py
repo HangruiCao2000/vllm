@@ -91,6 +91,49 @@ _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
 )
 _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 
+# Architectures of the self-contained Qwen3 DSpark drafts whose checkpoints ship
+# the SAME architecture for the DSpark (``markov_rank > 0``) and the DFlash
+# (``markov_rank == 0``) variant, e.g. deepseek-ai/dflash_qwen3_4b_block7 and
+# deepseek-ai/dspark_qwen3_4b_block7 are both ``Qwen3DSparkModel``. The DSpark
+# model class serves both, because its Markov head is a no-op at rank 0.
+_SELF_CONTAINED_QWEN3_DSPARK_ARCHITECTURES = frozenset(
+    {
+        "Qwen3DSparkModel",
+        _QWEN3_OMNI_DSPARK_ARCHITECTURE,
+    }
+)
+
+
+def _route_self_contained_qwen3_dspark_draft(
+    method: SpeculativeMethod | None,
+    draft_architectures: list[str],
+    model_name: str,
+) -> SpeculativeMethod | None:
+    """Route a DFlash-named self-contained Qwen3 DSpark draft to the dspark method.
+
+    DeepSeek ships the same architecture for its DSpark (``markov_rank > 0``) and
+    DFlash (``markov_rank == 0``) drafts -- ``dflash_qwen3_4b_block7`` and
+    ``dspark_qwen3_4b_block7`` are both ``Qwen3DSparkModel`` -- and the DSpark
+    model class serves both. A ``method`` of ``"dflash"`` would EAGLE-rename such
+    a draft to an unregistered ``"DFlash<arch>"`` architecture, so use the dspark
+    path instead. See https://github.com/vllm-project/vllm/issues/49614.
+    """
+    if method != "dflash":
+        return method
+    matched = _SELF_CONTAINED_QWEN3_DSPARK_ARCHITECTURES.intersection(
+        draft_architectures
+    )
+    if not matched:
+        return method
+    logger.info_once(
+        "Draft model %s ships the self-contained %s architecture; using "
+        "speculative method 'dspark' instead of 'dflash' (the DSpark "
+        "implementation serves markov_rank == 0 DFlash checkpoints too).",
+        model_name,
+        ", ".join(sorted(matched)),
+    )
+    return "dspark"
+
 
 def _is_qwen3_omni_target(model_config: ModelConfig) -> bool:
     hf_config = model_config.hf_config
@@ -1409,6 +1452,18 @@ class SpeculativeConfig:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"
                     )
+
+                # A self-contained Qwen3 DSpark draft is served by its DSpark model
+                # class whatever its checkpoint is named, so route a "dflash"
+                # method (given explicitly, or inferred from a "dflash" model
+                # name) to the dspark path. Otherwise the draft architecture is
+                # EAGLE-renamed to an unregistered "DFlash<arch>" and the engine
+                # fails to start (issue #49614).
+                self.method = _route_self_contained_qwen3_dspark_draft(
+                    self.method,
+                    self.draft_model_config.architectures,
+                    self.draft_model_config.model,
+                )
 
                 if self.method in ("eagle", "eagle3"):
                     # EAGLE drafts share the target's positional space; a
