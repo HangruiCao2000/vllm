@@ -9,7 +9,7 @@
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -48,7 +48,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageEmbeddingItems,
+    ImageProcessorItems,
+    MultiModalDataItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
@@ -354,6 +358,25 @@ class NemotronParsePixelInputs(TensorSchema):
     data: Annotated[torch.Tensor, TensorShape("b", 3, "h", "w")]
 
 
+class NemotronParseImageEmbeddingInputs(TensorSchema):
+    """Dimensions:
+    - bn: Batch size * number of images
+    - ifs: Image feature size (dynamic: may be shorter than the tower's output)
+    - hs: Hidden size (must match the decoder's `d_model`)
+    """
+
+    type: Literal["image_embeds"]
+    data: Annotated[
+        torch.Tensor | list[torch.Tensor],
+        TensorShape("bn", "ifs", "hs", dynamic_dims={"ifs"}),
+    ]
+
+
+NemotronParseImageInputs: TypeAlias = (
+    NemotronParsePixelInputs | NemotronParseImageEmbeddingInputs
+)
+
+
 class NemotronParseProcessingInfo(BaseProcessingInfo):
     def get_default_tok_params(self) -> TokenizeParams:
         return super().get_default_tok_params().with_kwargs(add_special_tokens=False)
@@ -498,7 +521,10 @@ class NemotronParseMultiModalProcessor(
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(pixel_values=MultiModalFieldConfig.batched("image"))
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_embeds=MultiModalFieldConfig.batched("image"),
+        )
 
     def _get_prompt_updates(
         self,
@@ -506,13 +532,33 @@ class NemotronParseMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        num_image_tokens = self.info.get_num_image_tokens()
+        max_image_tokens = self.info.get_num_image_tokens()
+
+        def get_replacement(item_idx: int) -> list[int]:
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems)
+            )
+
+            if isinstance(images, ImageEmbeddingItems):
+                # The encoder budget is sized from `get_num_image_tokens`, so a
+                # longer sequence would never be schedulable.
+                num_image_tokens = images.get_feature_size(item_idx)
+                if num_image_tokens > max_image_tokens:
+                    raise ValueError(
+                        f"Image embeddings at index {item_idx} have "
+                        f"{num_image_tokens} features, but at most "
+                        f"{max_image_tokens} are supported."
+                    )
+            else:
+                num_image_tokens = max_image_tokens
+
+            return [0] * num_image_tokens
 
         return [
             PromptReplacement(
                 modality="image",
                 target=[0],
-                replacement=[0] * num_image_tokens,
+                replacement=get_replacement,
             )
         ]
 
@@ -675,7 +721,7 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
-    ) -> NemotronParsePixelInputs | None:
+    ) -> NemotronParseImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
 
@@ -697,14 +743,26 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
             )
 
         if image_embeds is not None:
-            raise NotImplementedError
+            return NemotronParseImageEmbeddingInputs(
+                type="image_embeds",
+                data=image_embeds,
+                resolve_bindings={"hs": self.config.decoder.d_model},
+            )
 
         raise AssertionError("This line should be unreachable.")
 
     def _process_image_input(
-        self, image_input: NemotronParsePixelInputs
-    ) -> torch.Tensor:
-        assert image_input["type"] == "pixel_values"
+        self, image_input: NemotronParseImageInputs
+    ) -> MultiModalEmbeddings:
+        if image_input["type"] == "image_embeds":
+            # Already at the decoder's cross-attention width, so these stand in
+            # for the encoder outputs as-is.
+            dtype = next(self.decoder.parameters()).dtype
+            image_embeds = image_input["data"]
+            if isinstance(image_embeds, torch.Tensor):
+                return image_embeds.to(dtype)
+            return [embeds.to(dtype) for embeds in image_embeds]
+
         pixel_values = image_input["data"]
         dtype = next(self.encoder.parameters()).dtype
         flat = self.input_norm(pixel_values.flatten(1), dtype)
