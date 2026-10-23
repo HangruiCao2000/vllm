@@ -12,6 +12,7 @@ from transformers import BatchFeature
 
 from vllm.model_executor.models.nemotron_parse3_5 import (
     NemotronParseProcessingInfo,
+    RadioMBartPrefixForCausalLM,
     RadioMBartPrefixMultiModalProcessor,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -99,3 +100,19 @@ def test_causal_prefix_fields_config_handles_empty_cached_hf_inputs() -> None:
     fields = processor._get_mm_fields_config(BatchFeature(), {})
 
     assert fields["pixel_values"].field.slices == []
+
+
+def test_causal_prefix_rejects_compile_mm_encoder() -> None:
+    """compile_mm_encoder must fail at init, not kill the engine mid-serving.
+
+    NaViT packing varies the encoder sequence length per request, and the compiled
+    encoder bakes it; without this guard the first image request raises inside the
+    compiled graph and takes EngineCore down.
+    """
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_mm_encoder=True)
+    )
+    model = RadioMBartPrefixForCausalLM.__new__(RadioMBartPrefixForCausalLM)
+
+    with pytest.raises(ValueError, match="compile_mm_encoder is not supported"):
+        RadioMBartPrefixForCausalLM.__init__(model, vllm_config=vllm_config)

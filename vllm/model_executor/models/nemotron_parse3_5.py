@@ -661,6 +661,16 @@ class RadioMBartPrefixForCausalLM(nn.Module, SupportsMultiModal, SupportsEagle3)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        if vllm_config.compilation_config.compile_mm_encoder:
+            # NaViT packing gives every request a different encoder sequence length,
+            # and the compiled encoder bakes both the packed dim and the cu_seqlens
+            # length, so the flag kills the engine on the first request.
+            raise ValueError(
+                "compile_mm_encoder is not supported for Nemotron Parse 3.5: NaViT "
+                "packing gives every request a different encoder sequence length, "
+                "which the compiled encoder cannot express yet. Remove "
+                "--compilation-config.compile_mm_encoder (the default is off)."
+            )
         config = vllm_config.model_config.hf_config
 
         self.config = config
