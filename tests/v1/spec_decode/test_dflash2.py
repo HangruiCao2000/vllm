@@ -933,3 +933,12 @@ def test_vocab_topk_matches_torch_topk(dtype, vocab_size):
     assert torch.equal(values, expected)
     assert torch.equal(scores.gather(-1, ids.long()), values)
     assert (ids.long().sort(dim=-1).values.diff(dim=-1) > 0).all()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_vocab_topk_ids_stay_in_range_on_nan_rows():
+    """CUDA-graph capture feeds NaN logits; the ids index the selector codebooks."""
+    scores = torch.randn(32, 248320, device="cuda", dtype=torch.bfloat16)
+    scores[::2] = float("nan")
+    _, ids = _vocab_topk(scores, 16)
+    assert ((ids >= 0) & (ids < scores.shape[1])).all()

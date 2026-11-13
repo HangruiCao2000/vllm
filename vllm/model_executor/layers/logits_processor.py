@@ -78,7 +78,12 @@ def _use_deep_select() -> bool:
         has_deep_select,
     )
 
-    return has_deep_select()
+    if not has_deep_select():
+        return False
+    # Registers torch.ops.deep_select.
+    import vllm.model_executor.layers.indexer_topk  # noqa: F401
+
+    return True
 
 
 def _deep_select_vocab_topk(
@@ -91,6 +96,8 @@ def _deep_select_vocab_topk(
         scores, k, None, None, False, False, values, ids, None,
         -1, float("-inf"), True, False,
     )  # fmt: skip
+    # A NaN row (e.g. a capture dummy run) leaves unwritten, out-of-range ids.
+    ids.clamp_(0, scores.shape[1] - 1)
     values, order = values.sort(dim=-1, descending=True)
     return values, ids.gather(-1, order)
 
