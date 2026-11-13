@@ -53,6 +53,41 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return impl(scores, k, sorted=True, deterministic=True)
 
 
+@cache
+def _flashinfer_clusters_topk() -> (
+    Callable[..., tuple[torch.Tensor, torch.Tensor]] | None
+):
+    """FlashInfer's cluster top-k, about twice the radix kernel over a vocabulary."""
+    if not current_platform.is_cuda() or not has_flashinfer():
+        return None
+    # Thread-block clusters need SM90.
+    if not current_platform.has_device_capability(90):
+        return None
+    try:
+        from flashinfer.topk import topk_clusters_exact
+    except ImportError:
+        return None
+    return topk_clusters_exact
+
+
+def _vocab_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over the vocabulary; ties may break differently from _topk."""
+    clusters = _flashinfer_clusters_topk()
+    if (
+        clusters is None
+        or not scores.is_cuda
+        or scores.dim() != 2
+        or scores.stride(1) != 1
+        or scores.dtype not in (torch.bfloat16, torch.float32)
+        # The kernel faults on a row stride that is not 16-byte aligned.
+        or (scores.stride(0) * scores.element_size()) % 16 != 0
+    ):
+        return _topk(scores, k)
+    ids, values = clusters(scores, k, output_values=True)
+    values, order = values.to(scores.dtype).sort(dim=-1, descending=True)
+    return values, ids.gather(-1, order)
+
+
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -307,7 +342,7 @@ class LogitsProcessor(PluggableLayer):
                     keepdim=True,
                 )
 
-        values, ids = _topk(logits, k)
+        values, ids = _vocab_topk(logits, k)
         # Convert shard-local indices to global vocab indices.
         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
 

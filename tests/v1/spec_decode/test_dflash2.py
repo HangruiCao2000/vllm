@@ -7,7 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.logits_processor import LogitsProcessor, _vocab_topk
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_dflash2 import (
     _grouped_conv,
@@ -915,3 +915,20 @@ def test_top_k_tokens_stay_in_the_processor_vocabulary(default_vllm_config):
     _, ids = processor.get_top_k_tokens(head, hidden_states, 4)
     assert (ids < vocab_size).all()
     assert (processor.get_top_tokens(head, hidden_states) < vocab_size).all()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vocab_size", [248320, 248319])
+def test_vocab_topk_matches_torch_topk(dtype, vocab_size):
+    """The cluster kernel returns the exact top-k values; only tied ids may differ.
+
+    248319 has a row stride that is not 16-byte aligned and takes the fallback.
+    """
+    torch.manual_seed(0)
+    scores = torch.randn(64, vocab_size, device="cuda").to(dtype)
+    values, ids = _vocab_topk(scores, 16)
+    expected, _ = torch.topk(scores, 16, dim=-1)
+    assert torch.equal(values, expected)
+    assert torch.equal(scores.gather(-1, ids.long()), values)
+    assert (ids.long().sort(dim=-1).values.diff(dim=-1) > 0).all()
