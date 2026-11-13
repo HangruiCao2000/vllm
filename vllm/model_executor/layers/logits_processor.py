@@ -70,13 +70,43 @@ def _flashinfer_clusters_topk() -> (
     return topk_clusters_exact
 
 
+@cache
+def _use_deep_select() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+        has_deep_select,
+    )
+
+    return has_deep_select()
+
+
+def _deep_select_vocab_topk(
+    scores: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = torch.empty(scores.shape[0], k, dtype=scores.dtype, device=scores.device)
+    ids = torch.empty(scores.shape[0], k, dtype=torch.int32, device=scores.device)
+    # Sorted values are fp32-only, so sort the k winners afterwards.
+    torch.ops.deep_select.topk(
+        scores, k, None, None, False, False, values, ids, None,
+        -1, float("-inf"), True, False,
+    )  # fmt: skip
+    values, order = values.sort(dim=-1, descending=True)
+    return values, ids.gather(-1, order)
+
+
 def _vocab_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the vocabulary; ties may break differently from _topk."""
+    if not scores.is_cuda or scores.dim() != 2:
+        return _topk(scores, k)
+    if _use_deep_select():
+        from vllm.model_executor.layers.indexer_topk import is_deep_select_supported
+
+        if is_deep_select_supported(scores, k):
+            return _deep_select_vocab_topk(scores, k)
     clusters = _flashinfer_clusters_topk()
     if (
         clusters is None
-        or not scores.is_cuda
-        or scores.dim() != 2
         or scores.stride(1) != 1
         or scores.dtype not in (torch.bfloat16, torch.float32)
         # The kernel faults on a row stride that is not 16-byte aligned.
