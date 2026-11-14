@@ -19,12 +19,18 @@ Currently monitors:
   (via `knobs.runtime.jit_post_compile_hook`)
 - TileLang `@tilelang.jit` first-time compilations
 - FlyDSL `MlirCompiler.compile` calls
+- DeepGEMM JIT compilations (new entries in its kernel cache directory)
 """
 
 import contextlib
+import ctypes
 import functools
 import importlib
 import os
+import select
+import struct
+import sys
+import threading
 from collections.abc import Generator, Mapping
 from contextlib import suppress
 from typing import Any, Literal, cast
@@ -43,6 +49,7 @@ _cutedsl_hook_installed: bool = False
 _flydsl_hook_installed: bool = False
 _tilelang_hook_installed: bool = False
 _tilelang_jitimpl_compile_depth: int = 0
+_deep_gemm_watch_fd: int | None = None
 
 
 def is_active() -> bool:
@@ -83,6 +90,7 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     # TODO: Remove the guard once tilelang upstream is fixed.
     if not current_platform.is_rocm():
         _setup_tilelang_jit_hook()
+    _setup_deep_gemm_jit_hook()
 
     logger.info(
         "Kernel JIT monitor activated; monitored JIT compilations during "
@@ -622,3 +630,111 @@ def numba_workqueue_threading_layer() -> Generator[None]:
         else:
             os.environ[key] = previous_env
         numba.config.THREADING_LAYER = previous_config
+
+
+# ------------------------------------------------------------------
+# DeepGEMM JIT hook
+# ------------------------------------------------------------------
+
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_INOTIFY_EVENT = struct.Struct("iIII")
+
+
+def _deep_gemm_cache_dir() -> str:
+    import vllm.envs as envs
+
+    # Same resolution as vllm.utils.deep_gemm._lazy_init.
+    root = os.environ.get("DG_JIT_CACHE_DIR") or os.path.join(
+        envs.VLLM_CACHE_ROOT, "deep_gemm"
+    )
+    return os.path.join(root, "cache")
+
+
+def _read_deep_gemm_compiles(fd: int) -> list[str]:
+    """Drain the inotify fd; each event names a new `<kernel>.<hash>` entry."""
+    try:
+        buf = os.read(fd, 1 << 16)
+    except BlockingIOError:
+        return []
+    names = []
+    offset = 0
+    while offset < len(buf):
+        *_, length = _INOTIFY_EVENT.unpack_from(buf, offset)
+        start = offset + _INOTIFY_EVENT.size
+        name = buf[start : start + length].rstrip(b"\0").decode(errors="replace")
+        offset = start + length
+        if name and not name.startswith("."):
+            names.append(name)
+    return names
+
+
+def _report_deep_gemm_compiles(fd: int) -> None:
+    for name in _read_deep_gemm_compiles(fd):
+        kernel, _, digest = name.partition(".")
+        _handle_jit_event(
+            backend="DeepGEMM",
+            event="JIT compilation",
+            fn_name=kernel,
+            detail=digest or None,
+        )
+
+
+def _watch_deep_gemm_cache(fd: int) -> None:
+    with suppress(OSError, ValueError):
+        while True:
+            select.select([fd], [], [])
+            _report_deep_gemm_compiles(fd)
+
+
+def _check_after_deep_gemm_call(fn: Any, fd: int) -> Any:
+    @functools.wraps(fn)
+    def checked(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        _report_deep_gemm_compiles(fd)
+        return out
+
+    return checked
+
+
+def _setup_deep_gemm_jit_hook() -> None:
+    """DeepGEMM compiles in C++ with no hook, so watch the cache it writes."""
+    global _deep_gemm_watch_fd
+    if _deep_gemm_watch_fd is not None or not sys.platform.startswith("linux"):
+        return
+    if not current_platform.is_cuda():
+        return
+    from vllm.utils import deep_gemm
+
+    if not deep_gemm.has_deep_gemm():
+        return
+    deep_gemm._lazy_init()
+    cache_dir = _deep_gemm_cache_dir()
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        mask = _IN_CREATE | _IN_MOVED_TO
+        if libc.inotify_add_watch(fd, os.fsencode(cache_dir), mask) < 0:
+            err = ctypes.get_errno()
+            os.close(fd)
+            raise OSError(err, f"inotify_add_watch({cache_dir}) failed")
+    except (OSError, AttributeError) as e:
+        logger.debug("DeepGEMM JIT monitor disabled: %s", e)
+        return
+    _deep_gemm_watch_fd = fd
+
+    # Error mode raises on the compiling call; warn mode keeps the hot path clean.
+    if _mode == "error":
+        for name, fn in list(vars(deep_gemm).items()):
+            if name.startswith("_") and name.endswith("_impl") and callable(fn):
+                setattr(deep_gemm, name, _check_after_deep_gemm_call(fn, fd))
+        return
+    threading.Thread(
+        target=_watch_deep_gemm_cache,
+        args=(fd,),
+        daemon=True,
+        name="jit-monitor-deep-gemm",
+    ).start()

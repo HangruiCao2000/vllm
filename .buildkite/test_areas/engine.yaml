@@ -26,6 +26,7 @@ steps:
   - tests/test_vllm_port
   - tests/jit_monitor/test_hooks.py
   - tests/jit_monitor/test_hooks_gpu.py
+  - tests/jit_monitor/test_deep_gemm_hook.py
   commands:
   - >-
     pytest -v -s
@@ -36,6 +37,7 @@ steps:
     test_vllm_port.py
     jit_monitor/test_hooks.py
     jit_monitor/test_hooks_gpu.py
+    jit_monitor/test_deep_gemm_hook.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Engine Core"

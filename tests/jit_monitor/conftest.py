@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import pytest
 
 from vllm.utils import jit_monitor
@@ -22,6 +24,9 @@ def _reset_monitor():
         jit_monitor._flydsl_hook_installed = False
         jit_monitor._tilelang_hook_installed = False
         jit_monitor._tilelang_jitimpl_compile_depth = 0
+        if jit_monitor._deep_gemm_watch_fd is not None:
+            os.close(jit_monitor._deep_gemm_watch_fd)
+            jit_monitor._deep_gemm_watch_fd = None
 
     reset()
     yield
