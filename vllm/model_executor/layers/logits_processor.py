@@ -70,6 +70,10 @@ def _flashinfer_clusters_topk() -> (
     return topk_clusters_exact
 
 
+# DeepSelect runs one CTA per row; below this the cluster kernel wins (GB200).
+_DEEP_SELECT_MIN_ROWS = 45
+
+
 @cache
 def _use_deep_select() -> bool:
     if not current_platform.is_cuda():
@@ -89,8 +93,12 @@ def _use_deep_select() -> bool:
 def _deep_select_vocab_topk(
     scores: torch.Tensor, k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    values = torch.empty(scores.shape[0], k, dtype=scores.dtype, device=scores.device)
-    ids = torch.empty(scores.shape[0], k, dtype=torch.int32, device=scores.device)
+    from vllm.model_executor.layers.indexer_topk import _get_empty_and_aligned_tensor
+
+    # Output rows must be 32-byte aligned, which [rows, k] is not for small k.
+    rows = scores.shape[0]
+    values = _get_empty_and_aligned_tensor(rows, k, scores.device, scores.dtype)
+    ids = _get_empty_and_aligned_tensor(rows, k, scores.device, torch.int32)
     # Sorted values are fp32-only, so sort the k winners afterwards.
     torch.ops.deep_select.topk(
         scores, k, None, None, False, False, values, ids, None,
@@ -106,7 +114,7 @@ def _vocab_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
     """Top-k over the vocabulary; ties may break differently from _topk."""
     if not scores.is_cuda or scores.dim() != 2:
         return _topk(scores, k)
-    if _use_deep_select():
+    if scores.shape[0] >= _DEEP_SELECT_MIN_ROWS and _use_deep_select():
         from vllm.model_executor.layers.indexer_topk import is_deep_select_supported
 
         if is_deep_select_supported(scores, k):

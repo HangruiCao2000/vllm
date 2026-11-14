@@ -920,16 +920,18 @@ def test_top_k_tokens_stay_in_the_processor_vocabulary(default_vllm_config):
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("vocab_size", [248320, 248328, 248319])
-def test_vocab_topk_matches_torch_topk(dtype, vocab_size):
+@pytest.mark.parametrize("rows", [16, 64])
+@pytest.mark.parametrize("k", [8, 16])
+def test_vocab_topk_matches_torch_topk(dtype, vocab_size, rows, k):
     """The fast vocab top-k returns the exact top-k values; only tied ids may differ.
 
     248328 rows are not 1024-byte aligned for DeepSelect and 248319 rows are not
     16-byte aligned for the cluster kernel, so they exercise both fallbacks.
     """
     torch.manual_seed(0)
-    scores = torch.randn(64, vocab_size, device="cuda").to(dtype)
-    values, ids = _vocab_topk(scores, 16)
-    expected, _ = torch.topk(scores, 16, dim=-1)
+    scores = torch.randn(rows, vocab_size, device="cuda").to(dtype)
+    values, ids = _vocab_topk(scores, k)
+    expected, _ = torch.topk(scores, k, dim=-1)
     assert torch.equal(values, expected)
     assert torch.equal(scores.gather(-1, ids.long()), values)
     assert (ids.long().sort(dim=-1).values.diff(dim=-1) > 0).all()
