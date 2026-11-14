@@ -825,6 +825,10 @@ class CombineTopkSwaIndicesKernel(
         do_not_specialize=[
             "combined_indices_stride",
             "topk_indices_stride",
+            # One read per request; chunked prefill slices these at any offset.
+            "query_start_loc_ptr",
+            "seq_lens_ptr",
+            "gather_lens_ptr",
             "M",
             "N",
         ]
@@ -921,9 +925,6 @@ class CombineTopkSwaIndicesKernel(
         *,
         topk_width: int,
         topk_indices: bool,
-        query_start_loc: bool,
-        seq_lens: bool,
-        gather_lens: bool,
         compress_ratio: int,
         index_topk: int,
         active_topk_width: int,
@@ -935,9 +936,6 @@ class CombineTopkSwaIndicesKernel(
         padded_topk = next_power_of_2(topk_width)
         input_variant = TritonPointerInputVariant.from_alignment(
             topk_indices=topk_indices,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
         )
         return self.CompileKey(
             TOP_K=topk,
@@ -976,26 +974,7 @@ class CombineTopkSwaIndicesKernel(
         # and the in-image bidirectional variant.
         image_widths = [0, image_width] if image_width > 0 else [0]
         return self._trace_dispatch(self.dispatch)(
-            zip_inputs(
-                dict(
-                    topk_indices=True,
-                    query_start_loc=True,
-                    seq_lens=True,
-                    gather_lens=True,
-                ),
-                dict(
-                    topk_indices=True,
-                    query_start_loc=False,
-                    seq_lens=False,
-                    gather_lens=True,
-                ),
-                dict(
-                    topk_indices=False,
-                    query_start_loc=False,
-                    seq_lens=False,
-                    gather_lens=False,
-                ),
-            ),
+            zip_inputs(dict(topk_indices=True), dict(topk_indices=False)),
             compress_ratio=compress_ratios,
             index_topk=index_topk,
             active_topk_width=active_topk_widths,
@@ -1013,9 +992,9 @@ class CombineTopkSwaIndicesKernel(
             topk_indices=variant.pointer(
                 "topk_indices", torch.int32, shape=(1, compile_key.PADDED_TOP_K)
             ),
-            query_start_loc=variant.pointer("query_start_loc", torch.int32),
-            seq_lens=variant.pointer("seq_lens", torch.int32),
-            gather_lens=variant.pointer("gather_lens", torch.int32),
+            query_start_loc=int32_ptr,
+            seq_lens=int32_ptr,
+            gather_lens=int32_ptr,
             M=1,
             N=1,
             TOP_K=compile_key.TOP_K,
