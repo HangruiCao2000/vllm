@@ -518,6 +518,29 @@ def test_encoder_chunk_no_free_memory_falls_back_to_one():
     )
 
 
+# After the encoder has run, its activations stay in the caching allocator:
+# on an H100 serving gemma-4-26B-A4B at gpu_memory_utilization=0.90 the driver
+# reported 3.1 GiB free while 5.2 GiB sat reserved but unused, so a chunk sized
+# from the driver count alone saw a third of the memory it could reuse.
+@pytest.mark.parametrize(
+    ("driver_free", "reserved", "allocated", "expected"),
+    [
+        (3 * GiB_bytes, 75 * GiB_bytes, 70 * GiB_bytes, 8 * GiB_bytes),
+        (8 * GiB_bytes, 70 * GiB_bytes, 70 * GiB_bytes, 8 * GiB_bytes),
+    ],
+)
+def test_encoder_free_bytes_counts_idle_allocator_memory(
+    monkeypatch, driver_free: int, reserved: int, allocated: int, expected: int
+):
+    total = 80 * GiB_bytes
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (driver_free, total)
+    )
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda: reserved)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda: allocated)
+    assert Gemma4ForConditionalGeneration._encoder_free_bytes() == (expected, total)
+
+
 # Peak extra memory of one image through ``vision_tower.patch_embedder`` +
 # ``vision_tower.encoder`` (the per-chunk calls in ``_process_image_input``),
 # measured as the caching allocator's peak-allocated delta on H100, transformers 5.20.2,

@@ -1089,6 +1089,9 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
     _process_audio_input = Gemma4ForConditionalGeneration._process_audio_input
     embed_multimodal = Gemma4ForConditionalGeneration.embed_multimodal
     _encoder_chunk = staticmethod(Gemma4ForConditionalGeneration._encoder_chunk)
+    _encoder_free_bytes = staticmethod(
+        Gemma4ForConditionalGeneration._encoder_free_bytes
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)

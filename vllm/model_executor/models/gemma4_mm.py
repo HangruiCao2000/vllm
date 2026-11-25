@@ -1341,6 +1341,21 @@ class Gemma4ForConditionalGeneration(
         return patches_per_item * per_patch + 3 * patches_per_item**2
 
     @staticmethod
+    def _encoder_free_bytes() -> tuple[int, int]:
+        """Free device memory an encoder chunk can use, and total memory.
+
+        The driver's free count misses memory the caching allocator holds
+        but is not using. Once the encoder has run, its activations stay
+        reserved there, so the driver count drops by that much even though
+        the next chunk can reuse it. Count both.
+        """
+        free, total = torch.accelerator.get_memory_info()
+        idle = (
+            torch.accelerator.memory_reserved() - torch.accelerator.memory_allocated()
+        )
+        return free + max(0, idle), total
+
+    @staticmethod
     def _encoder_chunk(
         patches_per_item: int,
         free_bytes: int,
@@ -1610,7 +1625,7 @@ class Gemma4ForConditionalGeneration(
             if self._enable_mm_lora:
                 max_batch_size = len(items)
             else:
-                free, total = torch.accelerator.get_memory_info()
+                free, total = self._encoder_free_bytes()
                 max_batch_size = min(
                     len(items),
                     self._encoder_chunk(
@@ -1751,7 +1766,7 @@ class Gemma4ForConditionalGeneration(
         total_frames = pixel_values.shape[0]
         if total_frames == 0 or len(fc_list) == 0:
             return []
-        free, total = torch.accelerator.get_memory_info()
+        free, total = self._encoder_free_bytes()
         max_batch_size = min(
             total_frames,
             self._encoder_chunk(

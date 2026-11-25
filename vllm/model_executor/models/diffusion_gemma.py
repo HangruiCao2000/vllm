@@ -298,6 +298,9 @@ class DiffusionGemmaForConditionalGeneration(
         Gemma4ForConditionalGeneration._parse_and_validate_multimodal_inputs
     )
     _encoder_chunk = staticmethod(Gemma4ForConditionalGeneration._encoder_chunk)
+    _encoder_free_bytes = staticmethod(
+        Gemma4ForConditionalGeneration._encoder_free_bytes
+    )
     _get_max_soft_tokens = Gemma4ForConditionalGeneration._get_max_soft_tokens
     _embed_patches = Gemma4ForConditionalGeneration._embed_patches
     _normalize_pixel_values = Gemma4ForConditionalGeneration._normalize_pixel_values
